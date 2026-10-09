@@ -21,8 +21,22 @@ Windows only (it uses `ReadProcessMemory` / `WriteProcessMemory` through ctypes)
 | `hexdump(addr, size=0x100, words=True)` | Hex + ASCII dump, grouped as big-endian words. |
 | `struct_read(addr, fields)` | Named fields, e.g. `"serve:u32@0x48, racket:str@0x4"`. |
 | `scan(value, type)` / `scan(pattern="30 2D ?? 2A")` | Cheat Engine-style first scan over PS3 RAM (value, text or wildcard pattern). |
-| `scan_next(condition)` | Filter the last scan: `=N`, `!=N`, `>N`, `<N`, `changed`, `unchanged`, `increased`, `decreased`. |
+| `scan(value="0.033..0.034", type="f32")` | Range scan (any numeric type), e.g. a 1/30 s delta time that is never an exact value. |
+| `scan_next(condition)` | Filter the last scan: `=N`, `!=N`, `>N`, `<N`, `lo..hi`, `changed`, `unchanged`, `increased`, `decreased`. |
 | `snapshot(label, addr, size)` / `diff(label)` | Show which words of a memory block changed between two moments. |
+| `watch(addr, type, seconds=2)` | Sample a value over time: distinct values, changes per second, counter rate (e.g. frames per second). |
+
+### RPCS3 game info and patches
+
+Memory writes cannot change game *code* when RPCS3 uses the LLVM PPU recompiler (the default): code is compiled
+ahead of time, so code changes go through RPCS3 patches, which apply when the game boots.
+
+| Tool | What it does |
+|---|---|
+| `rpcs3_game()` | Last booted game from `RPCS3.log`: title, serial, version, PPU executable hash (the patch key), decoder, applied patches. |
+| `rpcs3_patches(serial="", filter="", details="")` | Search the official `patch.yml` and `imported_patch.yml` for a game (default: the last booted one). `*` = enabled. |
+| `rpcs3_patch_write(name, lines, notes="")` | Add or replace a patch for the last booted game in `imported_patch.yml` and enable it. Lines like `be32 0x003f8a08 0x806300CC # comment`. Makes `.bak_*` backups and checks the YAML parses before writing. |
+| `rpcs3_patch_enable(name, enabled)` | Toggle a patch in `patch_config.yml` (with backup). |
 
 ### Top Spin 4 (BLES00668) helpers
 
@@ -42,7 +56,7 @@ Stamina and Mental (u32 each), +0x70 level, +0x74..+0x80 skills, +0x84 play styl
 Requires Python 3.10+.
 
 ```
-pip install "mcp>=1.2"
+pip install "mcp>=1.2" numpy pyyaml
 ```
 
 Register it with Claude Code for every folder (user scope):

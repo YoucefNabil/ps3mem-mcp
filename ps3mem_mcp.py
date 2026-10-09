@@ -239,12 +239,58 @@ def _search(rx, lo, hi, align, limit):
     return hits
 
 
+_NP = {'u8': '>u1', 's8': '>i1', 'u16': '>u2', 's16': '>i2', 'u32': '>u4', 's32': '>i4',
+       'u64': '>u8', 's64': '>i8', 'f32': '>f4', 'f64': '>f8'}
+
+
+def _num(x, t):
+    return float(x) if t.startswith('f') else int(x, 0)
+
+
+def _range_scan(value, t, start, end, limit, show):
+    import numpy as np
+    lo, hi = (_num(x.strip(), t) for x in value.split('..', 1))
+    dt = np.dtype(_NP[t])
+    size = dt.itemsize
+    a0, a1 = int(str(start), 0), int(str(end), 0) or PS3_END
+    a0 = a0 + BASE if a0 < PS3_END else a0
+    a1 = a1 + BASE if a1 <= PS3_END else a1
+    hits, vals = [], {}
+    for base, rsize in regions(a0, a1):
+        for off in range(0, rsize, 0x1000000):
+            n = min(0x1000000, rsize - off)
+            a = base + off
+            skip = (-a) % size
+            try:
+                buf = rd(a, n)
+            except RuntimeError:
+                continue
+            arr = np.frombuffer(buf, dt, (n - skip) // size, skip)
+            with np.errstate(invalid='ignore'):
+                idx = np.nonzero((arr >= lo) & (arr <= hi))[0]
+            for i in idx[:limit - len(hits)]:
+                h = a + skip + int(i) * size
+                hits.append(h)
+                vals[h] = arr[i].item()
+            if len(hits) >= limit:
+                break
+        if len(hits) >= limit:
+            break
+    _scan.update(addrs=hits, type=t, vals=vals)
+    head = ', '.join(f'{guest(x):#x}={_show(vals[x], t)}' for x in hits[:show])
+    more = ' (limit reached)' if len(hits) >= limit else ''
+    return f'{len(hits)} hits{more}: {head}' + (' ...' if len(hits) > show else '')
+
+
 @mcp.tool()
 def scan(value: str = '', type: str = 'u32', pattern: str = '', start: str = '0', end: str = '0',
          align: int = 0, max_results: int = 200000, show: int = 20) -> str:
     """New scan over PS3 RAM (start..end, default all). Either `value` of `type` (exact match,
-    aligned to the type size unless align given; type 'str' searches text), or `pattern` hex with ?? wildcards.
+    aligned to the type size unless align given; type 'str' searches text), a range 'lo..hi' (inclusive,
+    e.g. value='0.033..0.034' type='f32' for a 1/30 s delta time), or `pattern` hex with ?? wildcards.
     Results are kept for scan_next. Shows the first `show` addresses."""
+    if '..' in value and not pattern and type in TYPES:
+        return _range_scan(value, type, start, end, max_results, show)
     if pattern:
         rx, t = _pattern(pattern), None
     elif type == 'str':
@@ -272,7 +318,7 @@ def scan(value: str = '', type: str = 'u32', pattern: str = '', start: str = '0'
 
 @mcp.tool()
 def scan_next(condition: str, type: str = '', show: int = 20) -> str:
-    """Filter the last scan's results. condition: '=N', '!=N', '>N', '<N', 'changed', 'unchanged',
+    """Filter the last scan's results. condition: '=N', '!=N', '>N', '<N', 'lo..hi', 'changed', 'unchanged',
     'increased', 'decreased' (the last four compare against the values at the previous scan step)."""
     t = type or _scan['type'] or 'u32'
     f = _fmt(t)
@@ -286,7 +332,10 @@ def scan_next(condition: str, type: str = '', show: int = 20) -> str:
             pass
     c = condition.strip()
     m = re.match(r'(!=|>=|<=|=|>|<)\s*(.+)', c)
-    if m:
+    if '..' in c:
+        lo, hi = (_num(x.strip(), t) for x in c.split('..', 1))
+        test = lambda v, p: lo <= v <= hi
+    elif m:
         op, n = m.group(1), m.group(2)
         n = float(n) if t.startswith('f') else int(n, 0)
         test = {'=': lambda v, p: v == n, '!=': lambda v, p: v != n, '>': lambda v, p: v > n,
@@ -324,6 +373,346 @@ def diff(label: str, max_lines: int = 60) -> str:
     _snaps[label] = (a, new)
     extra = f'\n... {len(out) - max_lines} more' if len(out) > max_lines else ''
     return ('\n'.join(out[:max_lines]) + extra) if out else 'no change'
+
+
+@mcp.tool()
+def watch(addr: str, type: str = 'u32', seconds: float = 2.0, interval_ms: int = 20) -> str:
+    """Sample one value for `seconds` (every `interval_ms`) and summarise how it moves:
+    distinct values, changes per second, and the per-second rate for counters (e.g. frames per second)."""
+    import time
+    a = host(addr)
+    f = _fmt(type)
+    size = struct.calcsize(f)
+    seconds = min(max(seconds, 0.1), 30.0)
+    samples = []
+    t0 = time.perf_counter()
+    while (now := time.perf_counter() - t0) < seconds:
+        samples.append((now, struct.unpack(f, rd(a, size))[0]))
+        time.sleep(max(interval_ms, 1) / 1000)
+    vals = [v for _, v in samples]
+    changes = sum(1 for x, y in zip(vals, vals[1:]) if x != y)
+    span = samples[-1][0] - samples[0][0] or 1e-9
+    distinct = list(dict.fromkeys(vals))
+    out = [f'{guest(a):#x} {type}: {len(samples)} samples over {span:.2f}s, {changes} changes '
+           f'({changes / span:.1f}/s), min {_show(min(vals), type)}, max {_show(max(vals), type)}']
+    if len(distinct) <= 8:
+        out.append('values: ' + ', '.join(_show(v, type) for v in distinct))
+    else:
+        out.append(f'{len(distinct)} distinct values, first: ' + ', '.join(_show(v, type) for v in distinct[:5]))
+    if changes and all(y >= x for x, y in zip(vals, vals[1:])):
+        out.append(f'counter: +{(vals[-1] - vals[0]) / span:.2f} per second')
+    return '\n'.join(out)
+
+
+# ---------------------------------------------------------------- RPCS3 game info and patches
+k32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+
+
+def _rpcs3_dir():
+    buf = ctypes.create_unicode_buffer(1024)
+    n = wt.DWORD(1024)
+    if not k32.QueryFullProcessImageNameW(H(), 0, buf, ctypes.byref(n)):
+        raise RuntimeError('cannot get the emulator path')
+    return os.path.dirname(buf.value)
+
+
+k32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE]
+k32.CreateFileW.restype = wt.HANDLE
+
+
+def _open_shared(path):
+    """open() for reading a file RPCS3 holds open (it requires FILE_SHARE_DELETE, which Python's open lacks)."""
+    import msvcrt
+    h = k32.CreateFileW(path, 0x80000000, 7, None, 3, 0x80, None)     # GENERIC_READ, share all, OPEN_EXISTING
+    if h in (None, wt.HANDLE(-1).value):
+        raise OSError(f'cannot open {path} (error {ctypes.get_last_error()})')
+    return os.fdopen(msvcrt.open_osfhandle(h, os.O_RDONLY | os.O_BINARY), 'rb')
+
+
+def _game():
+    """Info about the last game booted, from the end of RPCS3.log."""
+    d = _rpcs3_dir()
+    path = os.path.join(d, 'log', 'RPCS3.log')
+    if not os.path.exists(path):
+        path = os.path.join(d, 'RPCS3.log')
+    with _open_shared(path) as fh:                       # read from the end: the log can be hundreds of MB
+        size = fh.seek(0, 2)
+        chunk, data, i = 0x400000, b'', -1
+        while i < 0 and len(data) < size:
+            n = min(chunk, size - len(data))
+            fh.seek(size - len(data) - n)
+            data = fh.read(n) + data
+            i = data.rfind(b'SYS: Title: ')
+            chunk *= 2
+        if i < 0:
+            raise RuntimeError('no game boot found in RPCS3.log')
+        j = data.find(b'PPU executable hash: ', i)
+        tail = data[i:(j + 200 if j >= 0 else i + 0x40000)].decode('utf-8', 'replace')
+    g = {'dir': d, 'log': path}
+    for key, rx in (('title', r'SYS: Title: (.*)'), ('serial', r'SYS: Serial: (\S+)'),
+                    ('version', r'APP_VER=(\S+)'), ('config', r'Applying custom config: (.*)'),
+                    ('decoder', r'PPU Decoder: (.*)'), ('hash', r'PPU executable hash: (PPU-[0-9a-f]+)')):
+        m = re.search(rx, tail)
+        if m:
+            g[key] = m.group(1).strip()
+    g['applied'] = re.findall(r"Applied patch \(hash='[^']*', description='([^']*)'", tail)
+    return g
+
+
+@mcp.tool()
+def rpcs3_game() -> str:
+    """Last booted game from RPCS3.log: title, serial, app version, PPU executable hash (the patch.yml key),
+    PPU decoder, custom config and the patches that were applied at boot."""
+    g = _game()
+    out = [f"{g.get('title')} [{g.get('serial')}] v{g.get('version')}  {g.get('hash', 'hash not logged yet')}",
+           f"PPU decoder: {g.get('decoder')} (with the LLVM recompiler, code edits in RAM are ignored; use patches)",
+           f"RPCS3: {g['dir']}"]
+    if g.get('config'):
+        out.append(f"custom config: {g['config']}")
+    out.append('applied patches: ' + ('; '.join(g['applied']) or 'none'))
+    return '\n'.join(out)
+
+
+_ycache = {}
+
+
+def _unique_anchors(text):
+    """patch.yml redefines some anchors (yaml-cpp allows it, PyYAML does not): rename each redefinition
+    and point later aliases at the newest one, which is what yaml-cpp does."""
+    rx = re.compile(r'(?<=[\s\[,:-])([&*])([A-Za-z0-9_.\-]+)')
+    seen = {}
+    for m in rx.finditer(text):
+        if m.group(1) == '&':
+            seen[m.group(2)] = seen.get(m.group(2), 0) + 1
+    if all(n == 1 for n in seen.values()):
+        return text
+    cur = {}
+
+    def sub(m):
+        kind, name = m.groups()
+        if seen.get(name, 0) < 2:
+            return m.group(0)
+        if kind == '&':
+            cur[name] = cur.get(name, 0) + 1
+        return f'{kind}{name}__{cur.get(name, 1)}'
+    return rx.sub(sub, text)
+
+
+def _yload(path):
+    import yaml
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _ycache.get(path, (None,))[0] != mt:
+        with open(path, encoding='utf-8') as fh:
+            text = _unique_anchors(fh.read())
+        # BaseLoader keeps every scalar as text, so versions like 01.00 stay '01.00'
+        _ycache[path] = (mt, yaml.load(text, Loader=getattr(yaml, 'CBaseLoader', yaml.BaseLoader)) or {})
+    return _ycache[path][1]
+
+
+def _patch_paths(d):
+    cfg = os.path.join(d, 'config', 'patch_config.yml')
+    if not os.path.exists(cfg) and os.path.exists(os.path.join(d, 'patch_config.yml')):
+        cfg = os.path.join(d, 'patch_config.yml')
+    return os.path.join(d, 'patches', 'patch.yml'), os.path.join(d, 'patches', 'imported_patch.yml'), cfg
+
+
+def _enabled(cfg, h, name):
+    try:
+        for games in cfg[h][name].values():
+            for vers in games.values():
+                for v in vers.values():
+                    if isinstance(v, dict) and str(v.get('Enabled')).lower() == 'true':
+                        return True
+    except (KeyError, AttributeError, TypeError):
+        pass
+    return False
+
+
+@mcp.tool()
+def rpcs3_patches(serial: str = '', filter: str = '', details: str = '') -> str:
+    """List RPCS3 patches (official patch.yml + imported_patch.yml) for a game serial (default: last booted game).
+    `filter` narrows by patch name (e.g. 'fps', '60'). `details` = exact patch name to show its notes and code.
+    '*' marks enabled patches; '<- current' marks the hash of the executable that was last booted."""
+    g = {}
+    try:
+        g = _game()
+    except Exception:
+        pass
+    serial = serial or g.get('serial', '')
+    d = g.get('dir') or _rpcs3_dir()
+    main, imported, cfgp = _patch_paths(d)
+    cfg = _yload(cfgp)
+    out = []
+    for path in (main, imported):
+        for h, patches in (_yload(path) or {}).items():
+            if not str(h).startswith(('PPU-', 'SPU-')) or not isinstance(patches, dict):
+                continue
+            for name, p in patches.items():
+                if not isinstance(p, dict):
+                    continue
+                games = p.get('Games') or {}
+                if serial and not any(isinstance(sv, dict) and serial in sv for sv in games.values()):
+                    continue
+                if filter and filter.lower() not in str(name).lower():
+                    continue
+                if details and details.lower() != str(name).lower():
+                    continue
+                if details:
+                    code = p.get('Patch') or []
+                    out.append(f"{name} [{h}] ({os.path.basename(path)}), enabled={_enabled(cfg, h, name)}\n"
+                               f"Author: {p.get('Author')}  Version: {p.get('Patch Version')}\n"
+                               f"Notes: {p.get('Notes', '')}\n{len(code)} lines:\n"
+                               + '\n'.join(str(c) for c in code[:60]))
+                else:
+                    out.append(f"{'*' if _enabled(cfg, h, name) else ' '} {name}  [{h[:16]}...]"
+                               f"{' <- current' if h == g.get('hash') else ''} ({os.path.basename(path)})")
+    if out:
+        return '\n'.join(out[:80])
+    return f'no patches for {serial or "any game"}' + (f' matching {filter or details!r}' if filter or details else '')
+
+
+def _backup(path):
+    import shutil, time
+    if os.path.exists(path):
+        bk = f"{path}.bak_{time.strftime('%Y%m%d_%H%M%S')}"
+        n = 1
+        while os.path.exists(bk):                      # never overwrite an earlier backup from the same second
+            n += 1
+            bk = f"{path}.bak_{time.strftime('%Y%m%d_%H%M%S')}_{n}"
+        shutil.copy2(path, bk)
+        return bk
+    return None
+
+
+def _scalar(x):
+    x = str(x)
+    if not x or x != x.strip() or ': ' in x or ' #' in x or x.endswith(':') or x[0] in '[]{}&*!|>\'"%@`,?:-#':
+        return json.dumps(x)
+    return x
+
+
+def _emit(node, ind=0):
+    """Minimal YAML writer for patch_config.yml (nested maps of text, lists of text), like RPCS3 writes it."""
+    out = []
+    for k, v in node.items():
+        pad = ' ' * ind
+        if isinstance(v, dict):
+            out.append(f'{pad}{_scalar(k)}:' + ('' if v else ' {}'))
+            if v:
+                out.append(_emit(v, ind + 2).rstrip('\n'))
+        elif isinstance(v, list):
+            out.append(f'{pad}{_scalar(k)}: [' + ', '.join(_scalar(i) for i in v) + ']')
+        else:
+            out.append(f'{pad}{_scalar(k)}: {_scalar(v)}')
+    return '\n'.join(out) + '\n'
+
+
+def _set_enabled(cfgp, h, name, title, serial, version, on):
+    cfg = _yload(cfgp) or {}
+    node = cfg.setdefault(h, {}).setdefault(name, {}).setdefault(title, {}).setdefault(serial, {})
+    node.setdefault(version, {})['Enabled'] = 'true' if on else 'false'
+    bk = _backup(cfgp)
+    with open(cfgp, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(_emit(cfg))
+    _ycache.pop(cfgp, None)
+    return bk
+
+
+def _patch_line(line):
+    line = line.strip()
+    if not line:
+        return None
+    if line.startswith('#') or line.startswith('- ['):
+        return '      ' + line
+    code, _, comment = line.partition('#')
+    toks = [t for t in re.split(r'[\s,\[\]]+', code) if t]
+    if len(toks) != 3:
+        raise ValueError(f'patch line needs "type address value": {line!r}')
+    return f'      - [ {toks[0]}, {toks[1]}, {toks[2]} ]' + (f' # {comment.strip()}' if comment.strip() else '')
+
+
+@mcp.tool()
+def rpcs3_patch_write(name: str, lines: str, notes: str = '', enable: bool = True,
+                      author: str = 'Claude', patch_version: str = '1.0') -> str:
+    """Add or replace a patch for the last booted game in patches/imported_patch.yml and (by default) enable it
+    in patch_config.yml. `lines`: one per line, 'be32 0x003f8a08 0x806300CC # comment' or '- [ be32, ..., ... ]'
+    (RPCS3 types: be16/be32/be64/bef32/bef64/byte/utf8...). Backs up both files first. Applies on next game boot."""
+    import yaml
+    g = _game()
+    for k in ('hash', 'title', 'serial', 'version'):
+        if not g.get(k):
+            raise RuntimeError(f'could not read the game {k} from RPCS3.log; boot the game once first')
+    h, title, serial, ver = g['hash'], g['title'], g['serial'], g['version']
+    body = [x for x in (_patch_line(l) for l in lines.splitlines()) if x]
+    n_code = sum(1 for x in body if x.lstrip().startswith('- ['))
+    if not n_code:
+        raise ValueError('no patch lines given')
+    q = json.dumps
+    block = [f'  {q(name)}:', '    Games:', f'      {q(title)}:', f'        {serial}: [ {ver} ]',
+             f'    Author: {q(author)}', f'    Notes: {q(notes)}', f'    Patch Version: {patch_version}',
+             '    Patch:'] + body
+    _, imported, cfgp = _patch_paths(g['dir'])
+    text = open(imported, encoding='utf-8').read() if os.path.exists(imported) else 'Version: 1.2\n'
+    L = text.splitlines()
+    top = next((i for i, l in enumerate(L) if l.rstrip() == f'{h}:'), None)
+    if top is None:
+        while L and not L[-1].strip():
+            L.pop()
+        L += ['', f'{h}:'] + block
+        action = 'added'
+    else:
+        end = next((i for i in range(top + 1, len(L))
+                    if L[i] and not L[i][0].isspace() and not L[i].startswith('#')), len(L))
+        names = {f'  {q(name)}:', f'  {name}:', f"  '{name}':"}
+        start = next((i for i in range(top + 1, end) if L[i].rstrip() in names), None)
+        if start is not None:
+            stop = next((i for i in range(start + 1, end) if re.match(r'  \S', L[i])), end)
+            while stop > start + 1 and not L[stop - 1].strip():
+                stop -= 1
+            L[start:stop] = block
+            action = 'replaced'
+        else:
+            ins = end
+            while ins > top + 1 and not L[ins - 1].strip():
+                ins -= 1
+            L[ins:ins] = [''] + block
+            action = 'added'
+    new = '\n'.join(L) + '\n'
+    got = ((yaml.safe_load(new) or {}).get(h) or {}).get(name) or {}
+    if len(got.get('Patch') or []) != n_code:
+        raise RuntimeError('generated YAML did not parse back correctly; nothing was written')
+    bk = _backup(imported)
+    with open(imported, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(new)
+    _ycache.pop(imported, None)
+    msg = f'{action} "{name}" under {h} in {imported} ({n_code} lines)' + (f', backup {bk}' if bk else '')
+    if enable:
+        cbk = _set_enabled(cfgp, h, name, title, serial, ver, True)
+        msg += f'\nenabled in {cfgp}' + (f' (backup {cbk})' if cbk else '')
+    return msg + '\nReboot the game to apply. Close the RPCS3 patch manager first, or it may overwrite patch_config.yml.'
+
+
+@mcp.tool()
+def rpcs3_patch_enable(name: str, enabled: bool = True, hash: str = '') -> str:
+    """Enable or disable a patch (exact name) for the last booted game in patch_config.yml. Backs up first."""
+    g = _game()
+    h = hash or g.get('hash')
+    main, imported, cfgp = _patch_paths(g['dir'])
+    for path in (imported, main):
+        p = ((_yload(path) or {}).get(h) or {}).get(name)
+        if not isinstance(p, dict):
+            continue
+        for title, sv in (p.get('Games') or {}).items():
+            vers = (sv or {}).get(g.get('serial'))
+            if vers is None:
+                continue
+            for ver in (vers if isinstance(vers, list) and vers else [g.get('version')]):
+                bk = _set_enabled(cfgp, h, name, title, g['serial'], str(ver), enabled)
+            return f'"{name}" {"enabled" if enabled else "disabled"} (backup {bk}). Reboot the game to apply.'
+    return f'no patch named {name!r} for {g.get("serial")} under {h}'
 
 
 # ---------------------------------------------------------------- Top Spin 4 roster
