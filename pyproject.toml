@@ -1,0 +1,7 @@
+[project]
+name = "ps3mem-mcp"
+version = "0.1.0"
+description = "Headless MCP server to read, write and scan PS3 guest memory in a running RPCS3"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.2"]
