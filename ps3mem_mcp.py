@@ -7,7 +7,7 @@ Top Spin 4 helpers (ts4_*) sit on top of the generic tools.
 import ctypes, ctypes.wintypes as wt, json, os, re, struct, subprocess, difflib
 from mcp.server.fastmcp import FastMCP
 
-BASE = 0x300000000          # RPCS3 maps PS3 virtual memory here
+BASE = 0x300000000          # RPCS3 maps PS3 virtual memory here; _detect_base() reads the real one from the log
 PS3_END = 0x100000000
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -59,7 +59,20 @@ def H():
             raise RuntimeError(f'OpenProcess failed (error {ctypes.get_last_error()}); run as admin?')
         _proc.update(h=h, pid=pid)
         _ts4.clear()
+        _detect_base()
     return _proc['h']
+
+
+def _detect_base():
+    """RPCS3 picks the guest memory base at startup (0x300000000, 0x500000000, ...); it logs it near the top."""
+    global BASE
+    try:
+        with _open_shared(os.path.join(_rpcs3_dir(), 'log', 'RPCS3.log')) as fh:
+            m = re.search(rb'vm::g_base_addr = ([0-9a-fA-F]+)', fh.read(0x100000))
+        if m:
+            BASE = int(m.group(1), 16)
+    except OSError:
+        pass
 
 
 def host(a):
@@ -130,7 +143,7 @@ def _pattern(pattern):
 
 mcp = FastMCP('ps3mem', instructions=(
     'Read/write PS3 guest memory in a running RPCS3 (big-endian; addresses are PS3 addresses, '
-    'host = 0x300000000 + addr). Prefer these tools over ad-hoc ReadProcessMemory scripts. '
+    'host = RPCS3 base (0x300000000 or 0x500000000, read from RPCS3.log) + addr). Prefer these tools over ad-hoc ReadProcessMemory scripts. '
     'ts4_* tools understand the Top Spin 4 player roster.'))
 
 
