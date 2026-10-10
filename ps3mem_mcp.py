@@ -8,6 +8,7 @@ import ctypes, ctypes.wintypes as wt, json, os, re, struct, subprocess, difflib
 from mcp.server.fastmcp import FastMCP
 
 BASE = 0x300000000          # RPCS3 maps PS3 virtual memory here; _detect_base() reads the real one from the log
+EXEC = 0x500000000          # RPCS3's executable table (8 bytes per 4-byte guest instruction), also from the log
 PS3_END = 0x100000000
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -64,13 +65,17 @@ def H():
 
 
 def _detect_base():
-    """RPCS3 picks the guest memory base at startup (0x300000000, 0x500000000, ...); it logs it near the top."""
-    global BASE
+    """RPCS3 picks the guest memory base at startup (0x300000000, 0x500000000, ...); it logs it near the top,
+    with the executable table that follows it."""
+    global BASE, EXEC
     try:
         with _open_shared(os.path.join(_rpcs3_dir(), 'log', 'RPCS3.log')) as fh:
-            m = re.search(rb'vm::g_base_addr = ([0-9a-fA-F]+)', fh.read(0x100000))
+            head = fh.read(0x100000)
+        m = re.search(rb'vm::g_base_addr = ([0-9a-fA-F]+)', head)
         if m:
             BASE = int(m.group(1), 16)
+        m = re.search(rb'vm::g_exec_addr = ([0-9a-fA-F]+)', head)
+        EXEC = int(m.group(1), 16) if m else BASE + 0x200000000
     except OSError:
         pass
 
@@ -144,6 +149,7 @@ def _pattern(pattern):
 mcp = FastMCP('ps3mem', instructions=(
     'Read/write PS3 guest memory in a running RPCS3 (big-endian; addresses are PS3 addresses, '
     'host = RPCS3 base (0x300000000 or 0x500000000, read from RPCS3.log) + addr). Prefer these tools over ad-hoc ReadProcessMemory scripts. '
+    'rpcs3_code maps PS3 code addresses to RPCS3 compiled code and back, for Cheat Engine breakpoints. '
     'ts4_* tools understand the Top Spin 4 player roster.'))
 
 
@@ -726,6 +732,73 @@ def rpcs3_patch_enable(name: str, enabled: bool = True, hash: str = '') -> str:
                 bk = _set_enabled(cfgp, h, name, title, g['serial'], str(ver), enabled)
             return f'"{name}" {"enabled" if enabled else "disabled"} (backup {bk}). Reboot the game to apply.'
     return f'no patch named {name!r} for {g.get("serial")} under {h}'
+
+
+# ---------------------------------------------------------------- RPCS3 compiled code
+_code = {'pid': None}
+
+
+def _code_map(refresh):
+    """Guest <-> host pairs from the executable table: one little-endian host pointer per guest instruction.
+    With the LLVM decoder each compiled block has its own pointer; pointers shared by many instructions are
+    fallbacks (not compiled yet, interpreter), so they are dropped."""
+    import numpy as np
+    H()
+    if _code['pid'] == _proc['pid'] and not refresh:
+        return _code
+    hs, gs = [], []
+    for base, size in regions(EXEC, EXEC + 2 * PS3_END):
+        for off in range(0, size, 0x1000000):
+            a, n = base + off, min(0x1000000, size - off)
+            try:
+                arr = np.frombuffer(rd(a, n), '<u8')
+            except RuntimeError:
+                continue
+            idx = np.nonzero(arr)[0]
+            hs.append(arr[idx])
+            gs.append((a - EXEC) // 2 + idx.astype(np.uint64) * 4)
+    h = np.concatenate(hs) if hs else np.zeros(0, np.uint64)
+    g = np.concatenate(gs) if gs else np.zeros(0, np.uint64)
+    ptrs, inv, counts = np.unique(h, return_inverse=True, return_counts=True)
+    keep = counts[inv] <= 50
+    h, g = h[keep], g[keep]
+    by_h, by_g = np.argsort(h, kind='stable'), np.argsort(g, kind='stable')
+    _code.update(pid=_proc['pid'], h=h[by_h], hg=g[by_h], g=g[by_g], gh=h[by_g])
+    return _code
+
+
+@mcp.tool()
+def rpcs3_code(addrs: str, refresh: bool = False) -> str:
+    """Map code addresses between the PS3 game and RPCS3's compiled (LLVM) code, both ways, from RPCS3's
+    executable table (vm::g_exec_addr). A PS3 address (< 4 GiB) gives the host address of the compiled block
+    containing it: put Cheat Engine execute breakpoints there. A host address (an instruction CE reported)
+    gives the PS3 address where its block starts and how far into the block it is. Several addresses may be
+    given, separated by spaces or commas. The map is built on first use and again after RPCS3 restarts;
+    refresh=True rebuilds it when code was compiled since (new game or module)."""
+    import numpy as np
+    m = _code_map(refresh)
+    if not len(m['h']):
+        return 'no compiled blocks found in the executable table (is the PPU decoder LLVM?)'
+    out = []
+    for tok in addrs.replace(',', ' ').split():
+        a = int(tok, 0)
+        if a < PS3_END:
+            i = int(np.searchsorted(m['g'], a, 'right')) - 1
+            if i < 0 or a - int(m['g'][i]) > 0x1000:
+                out.append(f'{a:#x}: no compiled block')
+                continue
+            g, hst = int(m['g'][i]), int(m['gh'][i])
+            nxt = f', next block {int(m["g"][i + 1]):#x}' if i + 1 < len(m['g']) else ''
+            where = '' if g == a else f' (block starts at {g:#x}{nxt}; the instruction is inside it)'
+            out.append(f'{a:#x} -> host {hst:#x}{where}')
+        else:
+            i = int(np.searchsorted(m['h'], a, 'right')) - 1
+            if i < 0 or a - int(m['h'][i]) > 0x10000:
+                out.append(f'{a:#x}: not in compiled PS3 code')
+                continue
+            d = a - int(m['h'][i])
+            out.append(f'{a:#x} -> PS3 {int(m["hg"][i]):#x}' + (f' (+{d:#x} host bytes into its block)' if d else ''))
+    return '\n'.join(out)
 
 
 # ---------------------------------------------------------------- Top Spin 4 roster

@@ -37,6 +37,7 @@ ahead of time, so code changes go through RPCS3 patches, which apply when the ga
 | `rpcs3_patches(serial="", filter="", details="")` | Search the official `patch.yml` and `imported_patch.yml` for a game (default: the last booted one). `*` = enabled. |
 | `rpcs3_patch_write(name, lines, notes="")` | Add or replace a patch for the last booted game in `imported_patch.yml` and enable it. Lines like `be32 0x003f8a08 0x806300CC # comment`. Makes `.bak_*` backups and checks the YAML parses before writing. |
 | `rpcs3_patch_enable(name, enabled)` | Toggle a patch in `patch_config.yml` (with backup). |
+| `rpcs3_code(addrs, refresh=False)` | Map code addresses both ways between the game (PS3) and RPCS3's LLVM-compiled code, from the executable table (`vm::g_exec_addr` in the log). A PS3 address gives the host address of its compiled block, for Cheat Engine execute breakpoints; a host address CE reports gives the PS3 address of its block. Built on first use, rebuilt after RPCS3 restarts. |
 
 ### Top Spin 4 (BLES00668) helpers
 
